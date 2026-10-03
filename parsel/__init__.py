@@ -9,12 +9,23 @@ __version__ = "1.12.1"
 __all__ = [
     "Selector",
     "SelectorList",
+    "TreeRewrite",
+    "RewriteConflictError",
+    "InvalidFragmentError",
+    "TreeRewriteError",
     "css2xpath",
     "xpathfuncs",
 ]
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
-from parsel.selector import Selector, SelectorList
+from parsel.selector import (
+    InvalidFragmentError,
+    RewriteConflictError,
+    Selector,
+    SelectorList,
+    TreeRewrite,
+    TreeRewriteError,
+)
 
 xpathfuncs.setup()

@@ -17,6 +17,9 @@ from parsel.selector import (
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
+    InvalidFragmentError,
+    RewriteConflictError,
+    TreeRewrite,
 )
 
 if TYPE_CHECKING:
@@ -1354,6 +1357,286 @@ class TestExslt:
         sel = self.sscls(text=xml, type="xml")
         sel.xpath("//b").drop()
         assert sel.get() == expected
+
+
+class TestTreeRewrite:
+    sscls = Selector
+
+    def test_rewrite_factory(self) -> None:
+        sel = self.sscls(text="<html><body><p>x</p></body></html>")
+        assert isinstance(sel.rewrite(), TreeRewrite)
+        assert isinstance(sel.css("p").rewrite(), TreeRewrite)
+
+    def test_drop_nested_elements_html(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div>a"
+            "<div class='ad'>ad<a href='x'>link</a>after</div>"
+            "b</div><p>keep</p></body></html>"
+        )
+        # The selection contains both the ad container and the link inside it.
+        # That conflict is reported before mutating, and the caller can choose
+        # to keep the ancestor action explicitly.
+        plan = sel.rewrite()
+        plan.drop(sel.css(".ad, a"))
+        with pytest.raises(RewriteConflictError):
+            plan.commit()
+        plan.commit(on_conflict="ancestor")
+        assert sel.css(".ad, a") == []
+        assert sel.css("p::text").get() == "keep"
+        assert sel.css("div::text").getall() == ["ab"]
+        assert sel.css("div::text").get() == "ab"
+
+    @pytest.mark.parametrize(
+        ("xml", "expected"),
+        [
+            ("<a><b/>tail<c/></a>", "<a>tail<c/></a>"),
+            ("<a>text<b/>tail<c/></a>", "<a>texttail<c/></a>"),
+            ("<a><c/>previous<b/>tail</a>", "<a><c/>previoustail</a>"),
+            ("<a><!--z--><b/>tail</a>", "<a><!--z-->tail</a>"),
+            ("<a><b/>tail<b/>tail2</a>", "<a>tailtail2</a>"),
+        ],
+    )
+    def test_drop_keeps_tail_xml(self, xml: str, expected: str) -> None:
+        sel = self.sscls(text=xml, type="xml")
+        plan = sel.rewrite()
+        plan.drop(sel.xpath("//b"))
+        plan.commit()
+        assert sel.get() == expected
+
+    def test_adjacent_drops_do_not_swallow_text(self) -> None:
+        sel = self.sscls(
+            text="<html><body>pre<b>1</b>mid<b>2</b>post</body></html>"
+        )
+        with sel.css("b").rewrite() as plan:
+            plan.drop(sel.css("b"))
+        assert sel.get() == "<html><body>premidpost</body></html>"
+
+    def test_unwrap_keeps_text_and_tail_html(self) -> None:
+        sel = self.sscls(
+            text="<html><body><p>lead<span>T<b>x</b>U</span>tail</p></body></html>"
+        )
+        with sel.rewrite() as plan:
+            plan.unwrap(sel.css("span"))
+        assert sel.get() == "<html><body><p>lead<b>Tx</b>Utail</p></body></html>"
+
+    def test_unwrap_xml(self) -> None:
+        sel = self.sscls(text="<r>p<wrap>in<w/>t</wrap>q</r>", type="xml")
+        with sel.rewrite() as plan:
+            plan.unwrap(sel.xpath("//wrap"))
+        assert sel.get() == "<r>p<w>in</w>tq</r>"
+
+    def test_unwrap_empty_element_acts_like_drop(self) -> None:
+        sel = self.sscls(text="<r>a<empty/>b</r>", type="xml")
+        with sel.rewrite() as plan:
+            plan.unwrap(sel.xpath("//empty"))
+        assert sel.get() == "<r>ab</r>"
+
+    def test_replace_html_multiroot_with_text(self) -> None:
+        sel = self.sscls(
+            text="<html><body><p>x<em class='n'>old</em>after</p></body></html>"
+        )
+        with sel.rewrite() as plan:
+            plan.replace(sel.css(".n"), "lead <a>l</a><q>r</q> trail")
+        assert (
+            sel.get()
+            == "<html><body><p>xlead <a>l</a><q>r</q> trailafter</p></body></html>"
+        )
+
+    def test_replace_text_only_fragment_html(self) -> None:
+        sel = self.sscls(text="<html><body><p><em>x</em>tail</p></body></html>")
+        with sel.rewrite() as plan:
+            plan.replace(sel.css("em"), "REPL")
+        assert sel.get() == "<html><body><p>REPLtail</p></body></html>"
+
+    def test_replace_empty_fragment_html(self) -> None:
+        sel = self.sscls(
+            text="<html><body><p>x<em>x</em>tail</p></body></html>"
+        )
+        with sel.rewrite() as plan:
+            plan.replace(sel.css("em"), "")
+        assert sel.get() == "<html><body><p>xtail</p></body></html>"
+
+    def test_replace_xml_single_root(self) -> None:
+        sel = self.sscls(text="<r><a>old</a>tail</r>", type="xml")
+        with sel.rewrite() as plan:
+            plan.replace(sel.xpath("//a"), "<n>new</n>")
+        assert sel.get() == "<r><n>new</n>tail</r>"
+
+    @pytest.mark.parametrize("fragment", ["<x/><y/>", "text<n/>", "hello", ""])
+    def test_replace_invalid_xml_fragment_is_atomic(self, fragment: str) -> None:
+        sel = self.sscls(text="<r><a>old</a>tail</r>", type="xml")
+        before = sel.get()
+        plan = sel.rewrite()
+        plan.replace(sel.xpath("//a"), fragment)
+        with pytest.raises(InvalidFragmentError):
+            plan.commit()
+        assert sel.get() == before
+
+    def test_html_fragment_not_used_for_xml(self) -> None:
+        # Multiple roots parse fine in HTML but are invalid XML.
+        sel = self.sscls(text="<r><a/></r>", type="xml")
+        plan = sel.rewrite()
+        plan.replace(sel.xpath("//a"), "<b/><i/>")
+        with pytest.raises(InvalidFragmentError):
+            plan.commit()
+
+    def test_duplicate_node_acted_once(self) -> None:
+        sel = self.sscls(
+            text="<html><body><ul><li>a</li><li>b</li></ul></body></html>"
+        )
+        plan = sel.css("li").rewrite()
+        plan.drop(sel.xpath("//li"))
+        plan.commit()
+        assert sel.css("li") == []
+
+    def test_same_node_different_actions_conflict(self) -> None:
+        sel = self.sscls(text="<html><body><a>x</a></body></html>")
+        plan = sel.rewrite()
+        plan.drop(sel.css("a"))
+        with pytest.raises(RewriteConflictError):
+            plan.unwrap(sel.css("a"))
+        assert sel.css("a") != []
+
+    def test_nested_destructive_conflict_before_mutation(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div class='ad'><a href='#'>l</a></div></body></html>"
+        )
+        before = sel.get()
+        plan = sel.rewrite()
+        plan.drop(sel.css("a"))
+        plan.drop(sel.css(".ad"))
+        with pytest.raises(RewriteConflictError) as exc:
+            plan.commit()
+        assert exc.value.nested
+        assert sel.get() == before
+
+    def test_conflict_ancestor_wins(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div class='ad'><a href='#'>l</a></div></body></html>"
+        )
+        plan = sel.rewrite()
+        plan.drop(sel.css("a"))
+        plan.drop(sel.css(".ad"))
+        plan.commit(on_conflict="ancestor")
+        assert sel.css(".ad, a") == []
+
+    def test_conflict_ancestor_replace_wins(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div class='box'><a>x</a><span>y</span></div></body></html>"
+        )
+        plan = sel.rewrite()
+        plan.replace(sel.css(".box"), "<p>fresh</p>")
+        plan.drop(sel.css("a"))
+        plan.commit(on_conflict="ancestor")
+        assert sel.get() == "<html><body><p>fresh</p></body></html>"
+
+    def test_unwrap_ancestor_compatible_with_descendant_actions(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div>A<a>x</a>B</div></body></html>"
+        )
+        with sel.rewrite() as plan:
+            plan.unwrap(sel.css("div"))
+            plan.replace(sel.css("a"), "<b>Q</b>")
+        assert sel.get() == "<html><body><b>AQ</b>B</body></html>"
+
+    def test_order_independence(self) -> None:
+        def build() -> Selector:
+            return self.sscls(
+                text="<html><body><div>"
+                "<b class='r'>x</b><i class='u'>y<em>z</em></i>"
+                "</div></body></html>"
+            )
+
+        first, second = build(), build()
+        plan_a = first.rewrite()
+        plan_a.replace(first.css(".r"), "<a>1</a>")
+        plan_a.unwrap(first.css(".u"))
+        plan_a.commit()
+
+        plan_b = second.rewrite()
+        plan_b.unwrap(second.css(".u"))
+        plan_b.replace(second.css(".r"), "<a>1</a>")
+        plan_b.commit()
+
+        assert first.get() == second.get()
+        assert first.get() == "<html><body><div><a>1</a><em>yz</em></div></body></html>"
+
+    def test_root_node_cannot_be_rewritten(self) -> None:
+        sel = self.sscls(text="<r><a/></r>", type="xml")
+        plan = sel.rewrite()
+        plan.drop(sel.xpath("/r"))
+        with pytest.raises(CannotRemoveElementWithoutParent):
+            plan.commit()
+        assert sel.get() == "<r><a/></r>"
+
+    def test_pseudo_element_cannot_be_rewritten(self) -> None:
+        sel = self.sscls(text="<html><body><p>x</p></body></html>")
+        plan = sel.rewrite()
+        with pytest.raises(CannotRemoveElementWithoutRoot):
+            plan.drop(sel.css("p::text"))
+        assert sel.css("p::text").get() == "x"
+
+    def test_non_markup_selector_cannot_be_rewritten(self) -> None:
+        sel = self.sscls(text='{"a": [1, 2]}')
+        plan = sel.rewrite()
+        with pytest.raises(CannotRemoveElementWithoutRoot):
+            plan.drop(sel.jmespath("a"))
+
+    def test_invalid_on_conflict_value(self) -> None:
+        sel = self.sscls(text="<html><body><a/></body></html>")
+        plan = sel.rewrite()
+        plan.drop(sel.css("a"))
+        with pytest.raises(ValueError):
+            plan.commit(on_conflict="nope")  # type: ignore[arg-type]
+
+    def test_double_commit_is_noop(self) -> None:
+        sel = self.sscls(text="<html><body><ul><li>a</li><li>b</li></ul></body></html>")
+        plan = sel.rewrite()
+        plan.drop(sel.css("li"))
+        plan.commit()
+        plan.commit()
+        assert sel.css("li") == []
+
+    def test_context_manager_exception_does_not_commit(self) -> None:
+        sel = self.sscls(text="<html><body><a>x</a><b>y</b></body></html>")
+        plan = sel.rewrite()
+        with pytest.raises(RuntimeError):
+            with plan:
+                plan.drop(sel.css("a"))
+                raise RuntimeError("boom")
+        assert sel.css("a::text").get() == "x"
+
+    def test_surviving_selectors_keep_working(self) -> None:
+        sel = self.sscls(
+            text="<html><body><div class='ad'>ad<a>x</a></div>"
+            "<p class='keep'>keep</p></body></html>"
+        )
+        keep = sel.css(".keep")[0]
+        with sel.rewrite() as plan:
+            plan.drop(sel.css(".ad"))
+        assert keep.get() == "<p class=\"keep\">keep</p>"
+        assert keep.css("::text").get() == "keep"
+        assert sel.css(".keep::text").get() == "keep"
+
+    def test_cross_document_targets(self) -> None:
+        html_sel = self.sscls(
+            text="<html><body><div class='ad'>ad<a>x</a></div>"
+            "<p>keep</p></body></html>"
+        )
+        xml_sel = self.sscls(text="<r><ad>x<link/></ad><keep>y</keep></r>", type="xml")
+        html_keep = html_sel.css("p")[0]
+        xml_keep = xml_sel.xpath("//keep")[0]
+
+        plan = html_sel.rewrite()
+        plan.drop(html_sel.css(".ad"))
+        plan.unwrap(xml_sel.xpath("//ad"))
+        plan.commit()
+
+        assert html_sel.get() == "<html><body><p>keep</p></body></html>"
+        assert xml_sel.get() == "<r><link>x</link><keep>y</keep></r>"
+        assert html_keep.get() == "<p>keep</p>"
+        assert xml_keep.get() == "<keep>y</keep>"
+        assert xml_sel.xpath("//link")[0].get() == "<link>x</link>"
 
 
 class SelectorBytesInput(Selector):

@@ -17,6 +17,13 @@ def correct() -> None:
         "//somens:a/text()", namespaces={"somens": "http://scrapy.org"}
     ).extract()
 
+    # Tree rewrites return the plan from every scheduling method.
+    with selector.rewrite() as plan:
+        plan.drop(selector.css("li"))
+        plan.unwrap(selector.css("span"))
+        plan.replace(selector.xpath("//b"), "<i/>")
+    plan.commit(on_conflict="ancestor")
+
     class MySelector(Selector):
         def my_own_func(self) -> int:
             return 3

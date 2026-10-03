@@ -3,6 +3,18 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* Added :class:`parsel.TreeRewrite`, a one-commit tree rewriting plan
+  available through ``Selector.rewrite()`` and ``SelectorList.rewrite()``.
+  It supports deleting elements (``drop``), replacing an element by its
+  children (``unwrap``) and replacing elements by parsed HTML or XML
+  fragments (``replace``). Targets are resolved against the original tree,
+  duplicate nodes are acted upon once, conflicting ancestor/descendant
+  actions are reported before any mutation (or resolved with
+  ``on_conflict="ancestor"``), and invalid plans leave the tree untouched.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

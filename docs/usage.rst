@@ -585,6 +585,55 @@ Example removing an ad from a blog post:
     ['Content paragraph', '\n        \n    ', 'More content']
 
 
+Rewriting several nodes in one commit
+-------------------------------------
+
+Calling :meth:`~parsel.selector.SelectorList.drop` on several lists is order
+sensitive: once nodes are removed, later queries may select a different set
+of elements. When one selection also contains both a container and nodes
+inside it, such as an ad ``<div>`` and the links it contains, use the
+one-commit :class:`~parsel.TreeRewrite` plan returned by ``rewrite()``::
+
+    >>> from parsel import Selector
+    >>> sel = Selector(text="<div>Keep <b class='ad'>ad</b> and <span>old</span> <i>wrap <em>x</em> it</i></div>")
+    >>> plan = sel.rewrite()
+    >>> plan.drop(sel.css(".ad"))
+    >>> plan.unwrap(sel.css("i"))
+    >>> plan.replace(sel.css("span"), "<strong>new</strong>")
+    >>> plan.commit()
+    >>> sel.get()
+    '<html><body><div>Keep  and <strong>new</strong> <em>wrap x</em> it</div></body></html>'
+
+A plan supports three actions:
+
+- ``drop(selectors)`` removes the selected elements, keeping the text that
+  followed them (their lxml *tail*) next to the remaining siblings.
+- ``unwrap(selectors)`` replaces each element with its children; the element
+  text becomes the leading text of the first child and the element tail is
+  moved to the last child.
+- ``replace(selectors, fragment)`` replaces each element by a parsed
+  fragment; the original tail is moved after the fragment.
+
+All targets are resolved from the original tree before anything changes, and
+the same element selected more than once is acted upon only once. Destructive
+actions on both an ancestor and one of its descendants are reported as a
+:class:`~parsel.RewriteConflictError` before the tree is modified; pass
+``on_conflict="ancestor"`` to ``commit()`` to keep the ancestor actions and
+discard the descendant ones::
+
+    >>> sel = Selector(text="<div class='ad'><a>link</a></div><p>keep</p>")
+    >>> plan = sel.rewrite()
+    >>> plan.drop(sel.css(".ad"))
+    >>> plan.drop(sel.css("a"))
+    >>> plan.commit(on_conflict="ancestor")
+    >>> sel.get()
+    '<html><body><p>keep</p></body></html>'
+
+Fragments follow the document type: HTML fragments may contain several root
+elements and leading or trailing text, while XML fragments must contain
+exactly one root element and are validated with the XML parser. Any invalid
+fragment leaves the tree unchanged.
+
 Using EXSLT extensions
 ----------------------
 

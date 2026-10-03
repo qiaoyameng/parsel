@@ -55,6 +55,35 @@ class CannotDropElementWithoutParent(CannotRemoveElementWithoutParent):
     pass
 
 
+class TreeRewriteError(Exception):
+    """Base class for errors raised by :class:`TreeRewrite`."""
+
+
+class RewriteConflictError(TreeRewriteError):
+    """Raised when a single rewrite plan targets the same node more than once
+    with different actions, or when a destructive action targets both an
+    ancestor and a node it contains.
+
+    The tree is never modified when this is raised.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        same_node: list[tuple["Selector", str, str]] | None = None,
+        nested: list[tuple["Selector", str, "Selector", str]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.same_node = same_node or []
+        self.nested = nested or []
+
+
+class InvalidFragmentError(TreeRewriteError):
+    """Raised when a replacement fragment cannot be parsed for the document
+    type of the node it is meant to replace."""
+
+
 class SafeXMLParser(etree.XMLParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("resolve_entities", False)
@@ -92,6 +121,63 @@ _ENCODING_ERROR_TYPES = frozenset(
 
 def _has_encoding_error(parser: _ParserType) -> bool:
     return any(error.type in _ENCODING_ERROR_TYPES for error in parser.error_log)
+
+
+def _parse_html_fragment(
+    fragment: str,
+) -> tuple[str, list[etree._Element], str]:
+    """Parse an HTML fragment into ``(leading_text, elements, trailing_text)``.
+
+    HTML fragments are allowed to contain several root elements as well as
+    text before the first element and after the last element.
+    """
+    try:
+        parts = html.fragments_fromstring(fragment)
+    except (etree.LxmlError, TypeError) as exc:
+        raise InvalidFragmentError(f"Invalid HTML fragment: {fragment!r}") from exc
+    if parts and isinstance(parts[0], str):
+        leading = typing.cast("str", parts.pop(0))
+    else:
+        leading = ""
+    trailing = ""
+    if parts:
+        trailing = parts[-1].tail or ""
+        parts[-1].tail = None
+    return leading, typing.cast("list[etree._Element]", parts), trailing
+
+
+def _parse_xml_fragment(
+    fragment: str,
+) -> tuple[str, list[etree._Element], str]:
+    """Parse an XML fragment into ``(leading_text, elements, trailing_text)``.
+
+    XML fragments must contain exactly one root element, following XML
+    document rules. Text-only fragments, multiple root elements and text
+    outside the root element are rejected.
+    """
+    try:
+        wrapper = etree.fromstring(
+            f"<__parsel_fragment__>{fragment}</__parsel_fragment__>",
+            parser=SafeXMLParser(),
+        )
+    except etree.LxmlError as exc:
+        raise InvalidFragmentError(f"Invalid XML fragment: {fragment!r}") from exc
+    children = list(wrapper)
+    if len(children) != 1 or (wrapper.text or "").strip() or any(
+        child.tail and child.tail.strip() for child in children
+    ):
+        raise InvalidFragmentError(
+            f"XML fragments must contain exactly one root element: {fragment!r}"
+        )
+    return "", [children[0]], ""
+
+
+def _parse_fragment(
+    fragment: str, type_: str
+) -> tuple[str, list[etree._Element], str]:
+    if type_ == "xml":
+        return _parse_xml_fragment(fragment)
+    return _parse_html_fragment(fragment)
 
 
 def _root_from_decoded_body(
@@ -331,6 +417,334 @@ class SelectorList(list[_SelectorType]):
         """
         for x in self:
             x.drop()
+
+    def rewrite(self) -> TreeRewrite:
+        """Return an empty :class:`TreeRewrite` plan.
+
+        See the :class:`TreeRewrite` documentation for how to schedule
+        multiple deletions, unwrappings and fragment replacements that are
+        resolved against the original tree and applied in a single commit.
+        """
+        return TreeRewrite()
+
+
+_ACTION_DROP = "drop"
+_ACTION_UNWRAP = "unwrap"
+_ACTION_REPLACE = "replace"
+_DESTRUCTIVE_ACTIONS = frozenset({_ACTION_DROP, _ACTION_REPLACE})
+
+
+def _rewrite_target_element(selector: Selector) -> etree._Element:
+    """Return the element targeted by a rewrite action, rejecting selectors
+    that point at text nodes, attributes or non markup documents."""
+    if selector.type not in ("html", "xml"):
+        raise CannotRemoveElementWithoutRoot(
+            "Tree rewrites only work on Selector objects of the html or xml "
+            "type, with an element as the selected node."
+        )
+    root = selector.root
+    if not isinstance(root, etree._Element):
+        raise CannotRemoveElementWithoutRoot(
+            "The node you're trying to rewrite is not an element, "
+            "are you trying to rewrite a pseudo-element? "
+            "Try to use 'li' as a selector instead of 'li::text' or "
+            "'//li' instead of '//li/text()', for example."
+        )
+    return root
+
+
+def _drop_element(element: etree._Element) -> None:
+    """Remove *element* while keeping its tail text next to the siblings."""
+    parent = element.getparent()
+    if parent is None:
+        raise CannotDropElementWithoutParent(
+            "The node you're trying to remove has no parent, "
+            "are you trying to remove a root element?"
+        )
+    tail = element.tail
+    if tail:
+        previous = element.getprevious()
+        if previous is not None:
+            previous.tail = (previous.tail or "") + tail
+        else:
+            parent.text = (parent.text or "") + tail
+    parent.remove(element)
+
+
+def _unwrap_element(element: etree._Element) -> None:
+    """Replace *element* with its children, keeping all surrounding text."""
+    parent = element.getparent()
+    if parent is None:
+        raise CannotRemoveElementWithoutParent(
+            "The node you're trying to unwrap has no parent, "
+            "are you trying to unwrap a root element?"
+        )
+    index = parent.index(element)
+    element_text = element.text
+    tail = element.tail
+    children = list(element)
+    parent.remove(element)
+    if not children:
+        # Nothing of the element survives; its text and tail collapse the
+        # same way they do when an element is dropped.
+        trailing = (element_text or "") + (tail or "")
+        if trailing:
+            if index:
+                previous = parent[index - 1]
+                previous.tail = (previous.tail or "") + trailing
+            else:
+                parent.text = (parent.text or "") + trailing
+        return
+    for offset, child in enumerate(children):
+        parent.insert(index + offset, child)
+    first = children[0]
+    first.text = (element_text or "") + (first.text or "")
+    last = children[-1]
+    last.tail = (last.tail or "") + (tail or "")
+
+
+def _replace_element(
+    element: etree._Element,
+    leading: str,
+    nodes: list[etree._Element],
+    trailing: str,
+) -> None:
+    """Replace *element* with parsed fragment nodes and surrounding text."""
+    parent = element.getparent()
+    if parent is None:
+        raise CannotRemoveElementWithoutParent(
+            "The node you're trying to replace has no parent, "
+            "are you trying to replace a root element?"
+        )
+    index = parent.index(element)
+    tail = element.tail
+    parent.remove(element)
+    if leading:
+        if index:
+            previous = parent[index - 1]
+            previous.tail = (previous.tail or "") + leading
+        else:
+            parent.text = (parent.text or "") + leading
+    for offset, node in enumerate(nodes):
+        parent.insert(index + offset, node)
+    # The original tail follows the whole fragment; fragment trailing text
+    # precedes it, so neither piece can overwrite the other.
+    trailing = trailing + (tail or "")
+    if trailing:
+        if nodes:
+            nodes[-1].tail = (nodes[-1].tail or "") + trailing
+        elif index:
+            previous = parent[index - 1]
+            previous.tail = (previous.tail or "") + trailing
+        else:
+            parent.text = (parent.text or "") + trailing
+
+
+class TreeRewrite:
+    """A plan of tree modifications applied in a single commit.
+
+    Create a plan through :meth:`Selector.rewrite` or
+    :meth:`SelectorList.rewrite`, schedule actions with :meth:`drop`,
+    :meth:`unwrap` and :meth:`replace`, then apply everything at once with
+    :meth:`commit` or by using the plan as a context manager::
+
+        with sel.css(".ad").rewrite() as plan:
+            plan.drop(sel.css(".ad"))
+            plan.unwrap(sel.css(".ad > span"))
+            plan.replace(sel.css("span.note"), "<strong>note</strong>")
+
+    All targets are resolved from the original tree before anything is
+    modified. The same element selected several times is only acted upon once,
+    while different actions on overlapping ancestor/descendant nodes are
+    reported as a :class:`RewriteConflictError` before the tree is touched.
+    Pass ``on_conflict="ancestor"`` to :meth:`commit` to explicitly keep the
+    ancestor action and discard the conflicting descendant ones.
+
+    HTML replacement fragments may contain several root elements and
+    surrounding text; XML replacement fragments must contain exactly one root
+    element and are validated with the XML parser.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[etree._Element, tuple[Selector, str, str | None]] = {}
+        self._committed = False
+
+    def _add(
+        self,
+        selectors: Selector | SelectorList[Selector],
+        action: str,
+        fragment: str | None = None,
+    ) -> Self:
+        items = (
+            [selectors] if isinstance(selectors, Selector) else list(selectors)
+        )
+        for selector in items:
+            element = _rewrite_target_element(selector)
+            previous = self._entries.get(element)
+            if previous is not None:
+                _previous_selector, previous_action, previous_fragment = previous
+                if previous_action == action and previous_fragment == fragment:
+                    # The same node selected more than once is acted once.
+                    continue
+                raise RewriteConflictError(
+                    "The same node is scheduled with different actions: "
+                    f"{previous_action!r} and {action!r}."
+                )
+            self._entries[element] = (selector, action, fragment)
+        return self
+
+    def drop(self, selectors: Selector | SelectorList[Selector]) -> Self:
+        """Schedule the selected elements for removal.
+
+        The tail text of every removed element is kept next to the remaining
+        siblings, in both HTML and XML documents.
+        """
+        return self._add(selectors, _ACTION_DROP)
+
+    def unwrap(self, selectors: Selector | SelectorList[Selector]) -> Self:
+        """Schedule the selected elements to be unwrapped in place.
+
+        Each element is replaced by its own children. Its text becomes the
+        leading text of the first child, and its tail becomes the tail of the
+        last child, so no surrounding text is lost.
+        """
+        return self._add(selectors, _ACTION_UNWRAP)
+
+    def replace(
+        self, selectors: Selector | SelectorList[Selector], fragment: str
+    ) -> Self:
+        """Schedule the selected elements to be replaced by *fragment*.
+
+        The fragment is parsed according to the type of each targeted
+        document: HTML fragments allow multiple root elements and leading or
+        trailing text, while XML fragments must contain exactly one root
+        element. The tail of the replaced element is moved after the fragment.
+        """
+        if not isinstance(fragment, str):
+            raise TypeError("fragment must be a string")
+        return self._add(selectors, _ACTION_REPLACE, fragment)
+
+    def commit(
+        self,
+        *,
+        on_conflict: str = "error",
+    ) -> None:
+        """Validate and apply all scheduled actions in one pass.
+
+        ``on_conflict`` is ``"error"`` by default, which raises
+        :class:`RewriteConflictError` for overlapping destructive actions.
+        Use ``"ancestor"`` to keep the action of the outermost element and
+        discard the conflicting descendant actions.
+
+        If the plan is invalid, no element is modified.
+        """
+        if on_conflict not in ("error", "ancestor"):
+            raise ValueError(
+                f"Invalid on_conflict value: {on_conflict!r} "
+                "(expected 'error' or 'ancestor')."
+            )
+        if self._committed:
+            return
+
+        nested: list[tuple[Selector, str, Selector, str]] = []
+        for element, (selector, action, _fragment) in self._entries.items():
+            if action not in _DESTRUCTIVE_ACTIONS:
+                continue
+            ancestor = element.getparent()
+            while ancestor is not None:
+                ancestor_entry = self._entries.get(ancestor)
+                if (
+                    ancestor_entry is not None
+                    and ancestor_entry[1] in _DESTRUCTIVE_ACTIONS
+                ):
+                    nested.append(
+                        (
+                            ancestor_entry[0],
+                            ancestor_entry[1],
+                            selector,
+                            action,
+                        )
+                    )
+                ancestor = ancestor.getparent()
+
+        kept = dict(self._entries)
+        if nested:
+            if on_conflict == "error":
+                details = "; ".join(
+                    f"{ancestor_action}({ancestor.root.tag!r}) conflicts "
+                    f"with {descendant_action}({descendant.root.tag!r})"
+                    for (
+                        ancestor,
+                        ancestor_action,
+                        descendant,
+                        descendant_action,
+                    ) in nested
+                )
+                raise RewriteConflictError(
+                    "Conflicting actions on ancestor and descendant nodes: "
+                    f"{details}. Pass on_conflict='ancestor' to keep the "
+                    "ancestor actions.",
+                    nested=nested,
+                )
+            for _ancestor, _a_action, descendant, _d_action in nested:
+                kept.pop(descendant.root, None)
+
+        # Parse every fragment and re-check the parents before touching a
+        # tree, so a bad fragment leaves all documents unchanged.
+        parsed: dict[etree._Element, tuple[str, list[etree._Element], str]] = {}
+        for element, (selector, action, fragment) in kept.items():
+            if element.getparent() is None:
+                if action == _ACTION_DROP:
+                    raise CannotDropElementWithoutParent(
+                        "The node you're trying to remove has no parent, "
+                        "are you trying to remove a root element?"
+                    )
+                raise CannotRemoveElementWithoutParent(
+                    "The node you're trying to rewrite has no parent, "
+                    "are you trying to rewrite a root element?"
+                )
+            if action == _ACTION_REPLACE:
+                assert fragment is not None  # nosec
+                parsed[element] = _parse_fragment(fragment, selector.type)
+
+        # Apply deepest nodes first so that moving children never invalidates
+        # the targets of remaining actions.
+        for element, _entry in self._order_by_depth(kept):
+            action = _entry[1]
+            if action == _ACTION_DROP:
+                _drop_element(element)
+            elif action == _ACTION_UNWRAP:
+                _unwrap_element(element)
+            else:
+                leading, nodes, trailing = parsed[element]
+                _replace_element(element, leading, nodes, trailing)
+        self._committed = True
+
+    @staticmethod
+    def _order_by_depth(
+        entries: dict[etree._Element, tuple[Selector, str, str | None]]
+    ) -> list[tuple[etree._Element, tuple[Selector, str, str | None]]]:
+        def depth(element: etree._Element) -> int:
+            count = 0
+            parent = element.getparent()
+            while parent is not None:
+                count += 1
+                parent = parent.getparent()
+            return count
+
+        return sorted(entries.items(), key=lambda item: depth(item[0]), reverse=True)
+
+    def __enter__(self) -> TreeRewrite:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        if exc_type is None:
+            self.commit()
 
 
 _NOT_SET = object()
@@ -861,6 +1275,16 @@ class Selector:
         except (AttributeError, AssertionError):
             # 'NoneType' object has no attribute 'drop_tree'
             raise CannotDropElementWithoutParent(no_parent_message)
+
+    def rewrite(self) -> TreeRewrite:
+        """Return an empty :class:`TreeRewrite` plan.
+
+        The plan is independent of this selector; pass selectors to its
+        :meth:`TreeRewrite.drop`, :meth:`TreeRewrite.unwrap` and
+        :meth:`TreeRewrite.replace` methods, then call
+        :meth:`TreeRewrite.commit` to apply everything in one pass.
+        """
+        return TreeRewrite()
 
     @property
     def attrib(self) -> dict[str, str]:
