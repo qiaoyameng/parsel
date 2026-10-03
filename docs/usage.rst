@@ -284,6 +284,23 @@ Examples:
     See also: :ref:`extracting-text` and :ref:`selecting-attributes`.
 
 
+``:nth-child(An+B of selector-list)``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Parsel supports the Selectors Level 4 ``of`` clause of the
+``:nth-child()`` and ``:nth-last-child()`` pseudo-classes. The selector
+list after ``of`` is evaluated against the siblings of each candidate
+element first, and the ``An+B`` position is then computed within that
+filtered subset of siblings::
+
+    >>> selector.css('li:nth-child(2n+1 of .visible, [data-priority])')
+
+An element matched by several branches of the selector list is counted
+only once. The selector list may use combinators (`` `` , ``>``, ``+``,
+``~``), namespaces and ``:scope``. Pseudo-elements (``::text``,
+``::attr()``) are not allowed in the selector list and raise an error.
+
+
 .. _CSS Selectors: https://www.w3.org/TR/css3-selectors/#selectors
 
 .. _topics-selectors-nesting-selectors:

@@ -673,6 +673,14 @@ class Selector:
         nsp = dict(self.namespaces)
         if namespaces is not None:
             nsp.update(namespaces)
+        if (
+            isinstance(query, str)
+            and "parsel_scope" in query
+            and "parsel_scope" not in kwargs
+        ):
+            # Bound by the CSS translation of ":scope" / ":nth-child(... of ...)"
+            # to the element the CSS selector is evaluated against.
+            kwargs["parsel_scope"] = root
         try:
             xpathev = _get_xpath_evaluator(query, nsp, self._lxml_smart_strings)
             result = xpathev(root, **kwargs)

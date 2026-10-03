@@ -3,6 +3,16 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* Added support for the Selectors Level 4 ``of`` clause in
+  ``:nth-child()`` and ``:nth-last-child()``, e.g.
+  ``li:nth-child(2n+1 of .visible, [data-priority])``. Siblings are
+  filtered with the selector list first and the ``An+B`` position is then
+  computed within that subset; elements matched by multiple branches of the
+  selector list are counted once.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 
