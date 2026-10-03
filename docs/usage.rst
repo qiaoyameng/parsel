@@ -585,6 +585,71 @@ Example removing an ad from a blog post:
     ['Content paragraph', '\n        \n    ', 'More content']
 
 
+Rewriting elements in one commit
+--------------------------------
+
+Calling :meth:`~parsel.selector.SelectorList.drop` in a loop applies each
+removal immediately, so when a selection contains both a container and its
+descendants (e.g. an ad ``<div>`` and the links inside it), or when nodes are
+also replaced, the result depends on the order of the operations.
+
+:meth:`~parsel.selector.SelectorList.rewrite` applies one action to every
+element of a list in a single, atomic commit. It supports three actions:
+
+* ``"drop"`` removes the nodes, keeping each node's ``tail`` text;
+* ``"unwrap"`` replaces each node with its children, keeping the children and
+  the surrounding text;
+* ``"replace"`` replaces each node with the nodes parsed from an HTML or XML
+  fragment (the fragment may have several roots and leading text).
+
+All targets are resolved against the original tree before anything changes, a
+node appearing several times is acted upon only once, and if the plan is
+invalid none of the targeted trees is modified.
+
+    >>> sel = Selector(text="<div>a <b>B</b> middle <i>I</i> tail</div>")
+    >>> sel.css('b, i').rewrite('drop')
+    >>> sel.get()
+    '<html><body><div>a  middle  tail</div></body></html>'
+    >>> sel = Selector(text='<div><span>keep <b>text</b></span></div>')
+    >>> sel.css('span').rewrite('unwrap')
+    >>> sel.get()
+    '<html><body><div>keep <b>text</b></div></body></html>'
+    >>> sel = Selector(text='<div><a>old</a></div>')
+    >>> sel.css('a').rewrite('replace', '<i>new</i> content')
+    >>> sel.get()
+    '<html><body><div><i>new</i> content</div></body></html>'
+
+To mix different actions in the same commit, build a
+:class:`~parsel.selector.TreeRewritePlan` directly:
+
+    >>> from parsel import Selector, TreeRewritePlan
+    >>> sel = Selector(text="<root><b>B</b><u>U<x/></u><i>I</i></root>", type="xml")
+    >>> plan = TreeRewritePlan()
+    >>> plan.drop(sel.xpath("//b"))
+    >>> plan.unwrap(sel.xpath("//u"))
+    >>> plan.replace(sel.xpath("//i"), "<n>N</n>")
+    >>> plan.apply()
+    >>> sel.get()
+    '<root>U<x/><n>N</n></root>'
+
+When the plan targets both an ancestor and one of its descendants, the
+actions conflict and :meth:`~parsel.selector.TreeRewritePlan.apply` raises
+:class:`~parsel.selector.TreeRewriteConflict` before touching the tree. Pass
+``keep_ancestors=True`` to explicitly keep the ancestor actions and discard
+the descendant ones:
+
+    >>> sel = Selector(text="<div><p><a/></p></div>")
+    >>> plan = TreeRewritePlan()
+    >>> plan.drop(sel.css("p"))
+    >>> plan.unwrap(sel.css("a"))
+    >>> plan.apply(keep_ancestors=True)
+    >>> sel.get()
+    '<html><body><div></div></body></html>'
+
+Selectors pointing to nodes that survive the rewrite keep working, and
+targets from different documents can be combined in the same plan.
+
+
 Using EXSLT extensions
 ----------------------
 

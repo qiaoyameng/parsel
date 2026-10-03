@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from parsel import Selector
+from parsel import Selector, TreeRewritePlan
 
 
 def correct() -> None:
@@ -24,6 +24,12 @@ def correct() -> None:
     my_selector = MySelector()
     res: int = my_selector.my_own_func()
     sub_res: int = my_selector.xpath("//somens:a/text()")[0].my_own_func()
+
+    selector.css("li").rewrite("drop")
+    selector.css("li").rewrite("replace", "<b/>", keep_ancestors=True)
+    plan = TreeRewritePlan(selector.css("li"))
+    plan.unwrap(selector.css("li"))
+    plan.apply()
 
 
 # Negative checks: all the code lines below have typing errors.

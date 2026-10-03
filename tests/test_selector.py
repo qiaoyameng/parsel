@@ -14,6 +14,9 @@ from lxml import etree
 import parsel.selector as selector_module
 from parsel import Selector, SelectorList
 from parsel.selector import (
+    InvalidTreeRewriteError,
+    TreeRewriteConflict,
+    TreeRewritePlan,
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
@@ -1354,6 +1357,220 @@ class TestExslt:
         sel = self.sscls(text=xml, type="xml")
         sel.xpath("//b").drop()
         assert sel.get() == expected
+
+
+class TestTreeRewrite:
+    sscls = Selector
+
+    def test_drop_adjacent_keeps_all_text(self) -> None:
+        sel = self.sscls(text="<div>before <b>x</b> middle <i>y</i> after</div>")
+        sel.css("b, i").rewrite("drop")
+        assert sel.css("div")[0].get() == "<div>before  middle  after</div>"
+
+    def test_drop_is_equivalent_to_drop_method(self) -> None:
+        for xml, expected in [
+            ("<a><b/>tail<c/></a>", "<a>tail<c/></a>"),
+            ("<a>text<b/>tail<c/></a>", "<a>texttail<c/></a>"),
+            ("<a><c/>previous<b/>tail</a>", "<a><c/>previoustail</a>"),
+            ("<a><!--comment--><b/>tail</a>", "<a><!--comment-->tail</a>"),
+            ("<a><b/>tail<b/>tail2</a>", "<a>tailtail2</a>"),
+        ]:
+            sel = self.sscls(text=xml, type="xml")
+            sel.xpath("//b").rewrite("drop")
+            assert sel.get() == expected
+
+    def test_unwrap_keeps_children_and_text(self) -> None:
+        sel = self.sscls(text="<div>pre<p>P<u>U<x/>in</u>after</p>post</div>")
+        sel.css("u").rewrite("unwrap")
+        assert sel.css("p")[0].get() == "<p>PU<x></x>inafter</p>"
+
+    def test_unwrap_xml(self) -> None:
+        sel = self.sscls(text="<a>t<w>W<x/><y/>w2</w>z</a>", type="xml")
+        sel.xpath("//w").rewrite("unwrap")
+        assert sel.get() == "<a>tW<x/><y/>w2z</a>"
+
+    def test_unwrap_empty_element_with_tail(self) -> None:
+        sel = self.sscls(text="<a><c/>x<w/>tail<c/></a>", type="xml")
+        sel.xpath("//w").rewrite("unwrap")
+        assert sel.get() == "<a><c/>xtail<c/></a>"
+
+    def test_unwrap_several_siblings(self) -> None:
+        sel = self.sscls(text="<div>0<u>a</u>m<u>b</u>e</div>")
+        sel.css("u").rewrite("unwrap")
+        assert sel.css("div")[0].get() == "<div>0ambe</div>"
+
+    def test_replace_with_multiple_roots_and_text(self) -> None:
+        sel = self.sscls(text="<div>pre<a>old</a>tail</div>")
+        sel.css("a").rewrite("replace", "lead <b>B</b> and <i>I</i>end")
+        assert sel.css("div")[0].get() == (
+            "<div>prelead <b>B</b> and <i>I</i>endtail</div>"
+        )
+
+    def test_replace_xml_multiple_roots(self) -> None:
+        sel = self.sscls(text="<a>t<r/>z</a>", type="xml")
+        sel.xpath("//r").rewrite("replace", "<x/><y>y</y>fin")
+        assert sel.get() == "<a>t<x/><y>y</y>finz</a>"
+
+    def test_replace_with_empty_and_text_only_fragments(self) -> None:
+        sel = self.sscls(text="<div>x<a>old</a>T</div>")
+        sel.css("a").rewrite("replace", "")
+        assert sel.css("div")[0].get() == "<div>xT</div>"
+        sel = self.sscls(text="<div>x<a>old</a>T</div>")
+        sel.css("a").rewrite("replace", "plain text")
+        assert sel.css("div")[0].get() == "<div>xplain textT</div>"
+
+    def test_replace_adjacent_targets(self) -> None:
+        sel = self.sscls(text="<a><r/>m<r/>e</a>", type="xml")
+        sel.xpath("//r").rewrite("replace", "<n/>T")
+        assert sel.get() == "<a><n/>Tm<n/>Te</a>"
+
+    def test_xml_fragment_is_strictly_validated(self) -> None:
+        sel = self.sscls(text="<a><r/></a>", type="xml")
+        with pytest.raises(InvalidTreeRewriteError):
+            sel.xpath("//r").rewrite("replace", "<bad>unclosed")
+        assert sel.get() == "<a><r/></a>"
+
+    def test_html_fragment_allows_loose_markup(self) -> None:
+        sel = self.sscls(text="<div><a/></div>")
+        sel.css("a").rewrite("replace", "<br>")
+        assert sel.css("br")
+
+    def test_mixed_actions_plan(self) -> None:
+        sel = self.sscls(
+            text="<root>t0<b>B</b>t1<u>U<x/>u2</u>t2<i>I</i>t3</root>",
+            type="xml",
+        )
+        plan = TreeRewritePlan()
+        plan.drop(sel.xpath("//b"))
+        plan.unwrap(sel.xpath("//u"))
+        plan.replace(sel.xpath("//i"), "<n>N</n>fin")
+        plan.apply()
+        assert sel.get() == "<root>t0t1U<x/>u2t2<n>N</n>fint3</root>"
+
+    def test_duplicate_node_is_acted_upon_once(self) -> None:
+        sel = self.sscls(text="<div><a>1</a><a>2</a></div>")
+        targets = sel.css("a")
+        plan = TreeRewritePlan(targets)
+        plan.drop(targets[0])
+        assert len(plan._entries) == 2
+        plan.apply()
+        assert sel.css("a") == []
+
+    def test_same_node_with_different_actions_conflicts(self) -> None:
+        sel = self.sscls(text="<div><a/></div>")
+        plan = TreeRewritePlan()
+        plan.drop(sel.css("a"))
+        with pytest.raises(TreeRewriteConflict):
+            plan.unwrap(sel.css("a"))
+
+    def test_ancestor_descendant_conflicts_before_modification(self) -> None:
+        sel = self.sscls(text="<div><p><a/></p></div>")
+        plan = TreeRewritePlan()
+        plan.drop(sel.css("p"))
+        plan.drop(sel.css("a"))
+        with pytest.raises(TreeRewriteConflict):
+            plan.apply()
+        assert sel.get() == "<html><body><div><p><a></a></p></div></body></html>"
+
+    def test_keep_ancestors_discards_descendant_actions(self) -> None:
+        sel = self.sscls(text="<div><p><a>x</a></p></div>")
+        plan = TreeRewritePlan()
+        plan.drop(sel.css("p"))
+        plan.unwrap(sel.css("a"))
+        plan.apply(keep_ancestors=True)
+        assert sel.get() == "<html><body><div></div></body></html>"
+
+    def test_keep_ancestors_keeps_deepest_survivors(self) -> None:
+        sel = self.sscls(text="<a><g><h><d/></h></g><g/></a>", type="xml")
+        plan = TreeRewritePlan(sel.xpath("//g"))
+        plan.drop(sel.xpath("//d"))
+        plan.apply(keep_ancestors=True)
+        assert sel.get() == "<a/>"
+
+    def test_pseudo_elements_are_rejected(self) -> None:
+        sel = self.sscls(text="<div><a>x</a></div>")
+        with pytest.raises(InvalidTreeRewriteError):
+            sel.css("a::text").rewrite("drop")
+        assert sel.css("a::text").getall() == ["x"]
+
+    def test_root_elements_are_rejected(self) -> None:
+        sel = self.sscls(text="<div><a/></div>")
+        with pytest.raises(InvalidTreeRewriteError):
+            sel.css("html").rewrite("drop")
+        xml_sel = self.sscls(text="<a><b/></a>", type="xml")
+        with pytest.raises(InvalidTreeRewriteError):
+            xml_sel.xpath("/a").rewrite("drop")
+
+    def test_invalid_plan_does_not_modify_any_document(self) -> None:
+        good = self.sscls(text="<div><a/></div>")
+        bad = self.sscls(text="<root><r/></root>", type="xml")
+        plan = TreeRewritePlan()
+        plan.drop(good.css("a"))
+        plan.replace(bad.xpath("//r"), "<unclosed")
+        with pytest.raises(InvalidTreeRewriteError):
+            plan.apply()
+        assert good.get() == "<html><body><div><a></a></div></body></html>"
+        assert bad.get() == "<root><r/></root>"
+
+    def test_cross_document_targets(self) -> None:
+        doc_html = self.sscls(text="<div><a>1</a></div>")
+        doc_xml = self.sscls(text="<root><a>2</a></root>", type="xml")
+        plan = TreeRewritePlan()
+        plan.drop(doc_html.css("a"))
+        plan.replace(doc_xml.xpath("//a"), "<b>X</b>")
+        plan.apply()
+        assert doc_html.get() == "<html><body><div></div></body></html>"
+        assert doc_xml.get() == "<root><b>X</b></root>"
+
+    def test_result_is_independent_of_operation_order(self) -> None:
+        import itertools
+
+        outputs = set()
+        for order in itertools.permutations(["b", "i", "u"]):
+            sel = self.sscls(text="<div>0<b>1</b>m<i>2</i>n<u>3</u>e</div>")
+            plan = TreeRewritePlan()
+            for tag in order:
+                plan.drop(sel.css(tag))
+            plan.apply()
+            outputs.add(sel.css("div")[0].get())
+        assert outputs == {"<div>0mne</div>"}
+
+    def test_selectors_of_surviving_nodes_keep_working(self) -> None:
+        sel = self.sscls(text="<div><p>keep</p><a>gone</a><p>keep2</p></div>")
+        second_paragraph = sel.css("p")[1]
+        sel.css("a").rewrite("drop")
+        assert second_paragraph.css("::text").get() == "keep2"
+        assert sel.css("p::text").getall() == ["keep", "keep2"]
+
+    def test_selectors_of_surviving_nodes_keep_working_after_replace(self) -> None:
+        sel = self.sscls(text="<div><a/><p>hi</p></div>")
+        paragraph = sel.css("p")[0]
+        sel.css("a").rewrite("replace", "<b/>")
+        assert paragraph.xpath("text()").get() == "hi"
+        assert sel.css("b") and sel.css("p")
+
+    def test_plan_cannot_be_applied_twice(self) -> None:
+        sel = self.sscls(text="<div><a/></div>")
+        plan = TreeRewritePlan(sel.css("a"))
+        plan.apply()
+        with pytest.raises(RuntimeError):
+            plan.apply()
+
+    def test_invalid_action_and_fragment_arguments(self) -> None:
+        sel = self.sscls(text="<div><a/></div>")
+        with pytest.raises(ValueError, match="Invalid rewrite action"):
+            sel.css("a").rewrite("explode")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="fragment"):
+            sel.css("a").rewrite("drop", fragment="<b/>")
+        with pytest.raises(ValueError, match="fragment"):
+            sel.css("a").rewrite("replace")
+
+    def test_nested_replace_fragment_text_belongs_correctly(self) -> None:
+        sel = self.sscls(text="<a>p<r/>q</a>", type="xml")
+        sel.xpath("//r").rewrite(
+            "replace", "L<x>X</x>between<y>Y</y>R"
+        )
+        assert sel.get() == "<a>pL<x>X</x>between<y>Y</y>Rq</a>"
 
 
 class SelectorBytesInput(Selector):

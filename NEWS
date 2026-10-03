@@ -3,6 +3,17 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* Added ``SelectorList.rewrite()`` and the ``TreeRewritePlan`` class for
+  applying drop, unwrap and fragment-replace actions to a selection in a
+  single commit. Targets are resolved against the original tree before any
+  modification, duplicate nodes are acted upon once, ancestor/descendant
+  conflicts are reported up front (with an explicit ``keep_ancestors``
+  option), HTML and XML fragments are each parsed with their own rules, and
+  invalid plans leave the tree unchanged.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 
