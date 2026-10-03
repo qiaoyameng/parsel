@@ -252,3 +252,130 @@ class TestCSSSelector:
 
 class TestCSSSelectorBytes(TestCSSSelector):
     sel = Selector(body=bytes(HTMLBODY, encoding="utf-8"))
+
+
+NTH_CHILD_HTML = """
+<ul>
+  <li class="visible" id="one">1</li>
+  <li id="hidden-one">h1</li>
+  <li class="visible" id="two">2</li>
+  <li class="visible extra" id="duplicate">d</li>
+  <li data-priority id="priority">p</li>
+</ul>
+<section>
+  <div><span class="target" id="deep">deep</span></div>
+  <div class="group" id="group"></div>
+  <p class="middle" id="middle"></p>
+  <span class="target" id="adjacent">adjacent</span>
+  <span class="target" id="following">following</span>
+</section>
+"""
+
+
+@pytest.mark.parametrize("tr_cls", [GenericTranslator, HTMLTranslator])
+class TestNthChildOf:
+    def test_filter_before_counting(self, tr_cls: type[GenericTranslator]) -> None:
+        sel = Selector(text=NTH_CHILD_HTML)
+        query = "li:nth-child(odd of .visible, [data-priority])"
+        assert sel.css(query).xpath("@id").getall() == [
+            "one",
+            "duplicate",
+        ]
+
+    def test_duplicate_selector_branch_counts_once(
+        self, tr_cls: type[GenericTranslator]
+    ) -> None:
+        sel = Selector(text=NTH_CHILD_HTML)
+        query = "li:nth-child(even of .visible, .visible.extra, [data-priority])"
+        assert sel.css(query).xpath("@id").getall() == ["two", "priority"]
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            (
+                "li:nth-last-child(odd of .visible, [data-priority])",
+                ["two", "priority"],
+            ),
+            (
+                "li:nth-child(even of .visible, [data-priority])",
+                ["two", "priority"],
+            ),
+            ("li:nth-child(-n+2 of .visible, [data-priority])", ["one", "two"]),
+        ],
+    )
+    def test_series(
+        self,
+        tr_cls: type[GenericTranslator],
+        query: str,
+        expected: list[str],
+    ) -> None:
+        sel = Selector(text=NTH_CHILD_HTML)
+        assert sel.css(query).xpath("@id").getall() == expected
+
+    def test_combined_selector(self, tr_cls: type[GenericTranslator]) -> None:
+        sel = Selector(text=NTH_CHILD_HTML)
+        queries = {
+            "span:nth-child(1 of section div > .target, div .target)": ["deep"],
+            "span:nth-child(1 of .group + .middle + .target)": ["adjacent"],
+            "span:nth-child(2 of .group ~ .target)": ["following"],
+        }
+        for query, expected in queries.items():
+            assert sel.css(query).xpath("@id").getall() == expected
+
+    def test_pseudo_elements_and_cache(
+        self, tr_cls: type[GenericTranslator]
+    ) -> None:
+        translator = tr_cls()
+        query = "li:nth-child(1 of .visible)::text"
+        assert translator.css_to_xpath(query) == translator.css_to_xpath(query)
+        assert translator._cache.cache_info().hits == 1
+        assert Selector(text=NTH_CHILD_HTML).css(query).getall() == ["1"]
+
+        attr_query = "li:nth-child(1 of .visible)::attr(id)"
+        assert Selector(text=NTH_CHILD_HTML).css(attr_query).getall() == ["one"]
+
+    def test_namespace(self, tr_cls: type[GenericTranslator]) -> None:
+        xml = """
+        <root xmlns:n="http://example.com">
+          <n:item class="visible" id="one"/>
+          <n:item id="hidden"/>
+          <n:item class="visible" id="two"/>
+        </root>
+        """
+        sel = Selector(
+            text=xml,
+            type="xml",
+            namespaces={"n": "http://example.com"},
+        )
+        query = "n|item:nth-child(even of n|item.visible)"
+        assert sel.css(query).xpath("@id").getall() == ["two"]
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "li:nth-child(1 of ::text)",
+            "li:nth-child(1 of ::attr(id))",
+            "li:nth-child(1 of :scope)",
+            "li:nth-child(1 of > .visible)",
+        ],
+    )
+    def test_unsupported_selector(
+        self, tr_cls: type[GenericTranslator], query: str
+    ) -> None:
+        with pytest.raises((ExpressionError, SelectorSyntaxError)):
+            tr_cls().css_to_xpath(query)
+
+    def test_comma_in_pseudo_is_not_split(
+        self, tr_cls: type[GenericTranslator]
+    ) -> None:
+        query = "li:nth-child(1 of .a[title='x,y'], .b)"
+        xpath = tr_cls().css_to_xpath(query)
+        assert "title = 'x,y'" in xpath
+        assert " or " in xpath
+
+    def test_type_and_class_named_of(
+        self, tr_cls: type[GenericTranslator]
+    ) -> None:
+        sel = Selector(text='<ul><li class="of" id="of">of</li></ul>')
+        query = "li:nth-child(1 of .of, :is(.of))"
+        assert sel.css(query).xpath("@id").getall() == ["of"]
