@@ -8,6 +8,7 @@ import json
 import re
 import typing
 import warnings
+from dataclasses import replace
 from functools import lru_cache
 from io import BytesIO
 from typing import (
@@ -25,10 +26,11 @@ import jmespath
 from lxml import etree, html
 
 from .csstranslator import GenericTranslator, HTMLTranslator
+from .responsive import ImageResolution, resolve_image_for_element
 from .utils import extract_regex, flatten, iflatten, shorten
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Collection, Mapping
     from re import Pattern
 
 
@@ -349,8 +351,41 @@ class SelectorList(list[_SelectorType]):
         for x in self:
             x.drop()
 
+    def resolve_image(
+        self,
+        *,
+        viewport_width: float,
+        dpr: float,
+        supported_mime_types: Collection[str],
+    ) -> list[ImageResolution]:
+        """Resolve the responsive image URL for each element in this list.
+
+        See :meth:`Selector.resolve_image` for details.  Returns one
+        :class:`~parsel.responsive.ImageResolution` per element, in order.
+        """
+        return [
+            x.resolve_image(
+                viewport_width=viewport_width,
+                dpr=dpr,
+                supported_mime_types=supported_mime_types,
+            )
+            for x in self
+        ]
+
 
 _NOT_SET = object()
+
+
+def _find_img_element(root: Any) -> Any | None:
+    """Return the ``img`` element to resolve for a selector root node."""
+    tag = getattr(root, "tag", None)
+    if not isinstance(tag, str):
+        return None
+    if tag == "img":
+        return root
+    for el in root.iter("img"):
+        return el
+    return None
 
 
 def _get_root_from_text(text: str, *, type_: str, **lxml_kwargs: Any) -> etree._Element:
@@ -988,6 +1023,47 @@ class Selector:
             return {}
 
         return dict(self.root.attrib)
+
+    def resolve_image(
+        self,
+        *,
+        viewport_width: float,
+        dpr: float,
+        supported_mime_types: Collection[str],
+    ) -> ImageResolution:
+        """Resolve the responsive image URL for the selected element.
+
+        The element must be an ``img`` or ``picture`` element, or contain
+        one.  ``viewport_width`` is the viewport width in CSS pixels,
+        ``dpr`` the device pixel ratio and ``supported_mime_types`` the
+        image MIME types the caller can decode.  No JavaScript is
+        executed and no image is requested; the returned
+        :class:`~parsel.responsive.ImageResolution` keeps the associated
+        ``img``/``source`` selectors, the chosen URL and the reasons and
+        issues behind the choice.
+        """
+        if self.type != "html":
+            raise ValueError(
+                f"resolve_image is only supported for html selectors, got {self.type!r}"
+            )
+        img_el = _find_img_element(self.root)
+        if img_el is None:
+            raise ValueError("no <img> element found in the selected node")
+        resolution = resolve_image_for_element(
+            img_el,
+            viewport_width=viewport_width,
+            dpr=dpr,
+            supported_mime_types=supported_mime_types,
+        )
+        return replace(
+            resolution,
+            img=self.__class__(root=resolution.img),
+            source=(
+                self.__class__(root=resolution.source)
+                if resolution.source is not None
+                else None
+            ),
+        )
 
     def __bool__(self) -> bool:
         """
