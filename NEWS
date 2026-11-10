@@ -3,6 +3,17 @@
 History
 -------
 
+unreleased
+~~~~~~~~~~
+
+* Added ``parsel.xpathfuncs.XPathFunctionSession``, a context manager that
+  registers XPath extension functions for the duration of a query session,
+  as an alternative to the process-wide
+  ``parsel.xpathfuncs.set_xpathfunc()``. Session functions are identified
+  by their ``(namespace URI, local name)`` pair, are isolated across nested
+  sessions and threads, and never leak into the shared compiled-expression
+  cache.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

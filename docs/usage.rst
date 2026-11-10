@@ -804,6 +804,13 @@ Parsel also simplifies adding your own XPath extensions.
 
 .. autofunction:: parsel.xpathfuncs.set_xpathfunc
 
+If you need different extension functions for different queries, e.g. when
+two components each need their own version of a function with the same
+name, use a session instead of the process-wide registry:
+
+.. autoclass:: parsel.xpathfuncs.XPathFunctionSession
+    :members: register, unregister
+
 
 
 Some XPath tips

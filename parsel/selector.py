@@ -8,6 +8,7 @@ import json
 import re
 import typing
 import warnings
+from contextvars import ContextVar
 from functools import lru_cache
 from io import BytesIO
 from typing import (
@@ -415,6 +416,13 @@ _EXSLT_NAMESPACES = frozenset(
     for name in ("dates-and-times", "math", "sets", "strings")
 )
 
+#: Active query-session extension function registry, if any. Set and reset
+#: by ``parsel.xpathfuncs.XPathFunctionSession``. Being a context variable,
+#: it is isolated across threads and nested sessions.
+_xpath_function_session: ContextVar[Any] = ContextVar(
+    "parsel_xpath_function_session", default=None
+)
+
 
 @lru_cache(maxsize=2048)
 def _compile_xpath(
@@ -426,6 +434,7 @@ def _compile_xpath(
 def _get_xpath_evaluator(
     query: str, namespaces: dict[str, str], smart_strings: bool
 ) -> etree.XPath:
+    session = _xpath_function_session.get()
     namespaces = {
         prefix: uri
         for prefix, uri in namespaces.items()
@@ -433,6 +442,11 @@ def _get_xpath_evaluator(
         or not isinstance(query, str)
         or f"{prefix}:" in query
     }
+    if session is not None:
+        # Session extension functions are bound to the compiled expression,
+        # so it must not leak into the process-wide cache above: the session
+        # keeps its own cache, which it drops when the session ends.
+        return session.get_evaluator(query, namespaces, smart_strings)
     if _EXSLT_NAMESPACES.intersection(namespaces.values()):
         return etree.XPath(query, namespaces=namespaces, smart_strings=smart_strings)
     return _compile_xpath(query, tuple(sorted(namespaces.items())), smart_strings)
@@ -793,6 +807,12 @@ class Selector:
             xpathev = _get_xpath_evaluator(query, nsp, self._lxml_smart_strings)
             result = xpathev(root, **kwargs)
         except etree.XPathError as exc:
+            # An exception raised by an extension function can surface
+            # chained to the XPath evaluation error. Re-raise the original
+            # exception instead of reporting it as an XPath syntax error.
+            cause = exc.__cause__ or exc.__context__
+            if cause is not None and not isinstance(cause, etree.XPathError):
+                raise cause
             raise ValueError(f"XPath error: {exc} in {query}")
 
         if not isinstance(result, list):
