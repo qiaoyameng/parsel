@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from parsel import Selector
+from parsel import NodeKind, Selector
 
 
 def correct() -> None:
@@ -25,6 +25,18 @@ def correct() -> None:
     res: int = my_selector.my_own_func()
     sub_res: int = my_selector.xpath("//somens:a/text()")[0].my_own_func()
     jsonpath_res: int = my_selector.jsonpath("$.a")[0].my_own_func()
+
+    provenance_selector = Selector(
+        text="<html><body><p>x</p></body></html>", provenance=True
+    )
+    provenance = provenance_selector.xpath("//p")[0].provenance
+    provenance_kind: str = provenance.kind
+    assert provenance_kind == NodeKind.ELEMENT
+    located_value: object = provenance.locate().value
+    assert located_value
+    provenance_list = provenance_selector.xpath("//p").provenance
+    located_list = provenance_selector.xpath("//p").locate()
+    assert len(provenance_list) == len(located_list)
 
 
 # Negative checks: all the code lines below have typing errors.

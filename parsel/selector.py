@@ -8,6 +8,7 @@ import json
 import re
 import typing
 import warnings
+import weakref
 from functools import lru_cache
 from io import BytesIO
 from typing import (
@@ -25,6 +26,12 @@ import jmespath
 from lxml import etree, html
 
 from .csstranslator import GenericTranslator, HTMLTranslator
+from .provenance import (
+    LocatedNode,
+    Provenance,
+    get_document_provenance,
+    refresh as refresh_provenance,
+)
 from .utils import extract_regex, flatten, iflatten, shorten
 
 if TYPE_CHECKING:
@@ -349,6 +356,25 @@ class SelectorList(list[_SelectorType]):
         for x in self:
             x.drop()
 
+    @property
+    def provenance(self) -> list[Provenance]:
+        """
+        Return the provenance of every element in this list, in order.
+
+        Each entry keeps its own document identity, so combining selectors
+        from different documents in one list never mixes their sources.
+        """
+        return [x.provenance for x in self]
+
+    def locate(self) -> list[LocatedNode]:
+        """
+        Resolve the provenance of every element back to a parsed-tree node.
+
+        Raise :class:`~parsel.provenance.StaleProvenanceError` on the first
+        stale entry instead of silently returning a node that reuses its path.
+        """
+        return [x.locate() for x in self]
+
 
 _NOT_SET = object()
 
@@ -556,6 +582,8 @@ class Selector:
         "__weakref__",
         "_expr",
         "_huge_tree",
+        "_provenance",
+        "_provenance_finalizer",
         "_text",
         "body",
         "namespaces",
@@ -587,10 +615,17 @@ class Selector:
         base_url: str | None = None,
         _expr: str | None = None,
         huge_tree: bool = True,
+        provenance: bool | str = False,
+        _provenance: Provenance | None = None,
     ) -> None:
         self.root: Any
         if type not in ("html", "json", "text", "xml", None):
             raise ValueError(f"Invalid type: {type}")
+        if provenance and type in ("json", "text"):
+            raise ValueError(
+                "Provenance is only available for HTML and XML selectors, "
+                f"not for {type!r} selectors."
+            )
 
         if text is not None:
             if root is not _NOT_SET:
@@ -636,6 +671,27 @@ class Selector:
         self._expr = _expr
         self._huge_tree = huge_tree
         self._text = text
+        if _provenance is not None:
+            self._provenance: Provenance | None = _provenance
+        elif provenance:
+            if not etree.iselement(self.root):
+                raise ValueError(
+                    "Provenance can only track lxml element, attribute and "
+                    "text nodes."
+                )
+            document = get_document_provenance(self.root, provenance)
+            self._provenance = document.provenance_for(self.root, self.get())
+        else:
+            self._provenance = None
+        if self._provenance is not None:
+            # The provenance registry retains the document root (including
+            # implicit fragment wrappers). Release that entry once this owning
+            # selector disappears instead of leaking the whole tree.
+            self._provenance_finalizer = weakref.finalize(
+                self, self._provenance.document.release
+            )
+        else:
+            self._provenance_finalizer = None
 
     def __getstate__(self) -> Any:
         raise TypeError("can't pickle Selector objects")
@@ -790,7 +846,8 @@ class Selector:
         if namespaces is not None:
             nsp.update(namespaces)
         try:
-            xpathev = _get_xpath_evaluator(query, nsp, self._lxml_smart_strings)
+            smart_strings = self._lxml_smart_strings or self._provenance is not None
+            xpathev = _get_xpath_evaluator(query, nsp, smart_strings)
             result = xpathev(root, **kwargs)
         except etree.XPathError as exc:
             raise ValueError(f"XPath error: {exc} in {query}")
@@ -798,15 +855,20 @@ class Selector:
         if not isinstance(result, list):
             result = [result]
 
-        result = [
-            self.__class__(
+        built: list[Selector] = []
+        for x in result:
+            child = self.__class__(
                 root=x,
                 _expr=query,
                 namespaces=self.namespaces,
                 type=_xml_or_html(self.type),
             )
-            for x in result
-        ]
+            if self._provenance is not None:
+                child._provenance = self._provenance.document.provenance_for(
+                    x, child.get()
+                )
+            built.append(child)
+        result = built
         return typing.cast("SelectorList[Self]", self.selectorlist_cls(result))
 
     def css(self, query: str) -> SelectorList[Self]:
@@ -926,6 +988,10 @@ class Selector:
         Remove all namespaces, allowing to traverse the document using
         namespace-less xpaths. See :ref:`removing-namespaces`.
         For JSON selectors, this method does nothing.
+
+        This is an in-place tree mutation. Provenance captured before the call
+        is marked stale, because its element and attribute paths described the
+        pre-mutation tree.
         """
         if self.type == "json":
             return
@@ -939,15 +1005,36 @@ class Selector:
                     el.attrib[an.split("}", 1)[1]] = el.attrib.pop(an)
         # remove namespace declarations
         etree.cleanup_namespaces(self.root)
+        provenance = self._provenance
+        if provenance is not None:
+            provenance.document.bump()
+            # refresh_provenance stamps the new generation, so the refreshed
+            # location describes the post-mutation tree while older references
+            # keep the stale one.
+            self._provenance = refresh_provenance(provenance, self.get())
 
     def drop(self) -> None:
         """
         Drop matched nodes from the parent element.
         """
+        document = (
+            self._provenance.document if self._provenance is not None else None
+        )
+        if not etree.iselement(self.root):
+            if document is not None:
+                document.bump()
+            raise CannotRemoveElementWithoutRoot(
+                "The node you're trying to drop has no root, "
+                "are you trying to drop a pseudo-element? "
+                "Try to use 'li' as a selector instead of 'li::text' or "
+                "'//li' instead of '//li/text()', for example."
+            )
         try:
             parent = self.root.getparent()
         except AttributeError:
             # 'str' object has no attribute 'getparent'
+            if document is not None:
+                document.bump()
             raise CannotRemoveElementWithoutRoot(
                 "The node you're trying to drop has no root, "
                 "are you trying to drop a pseudo-element? "
@@ -976,7 +1063,11 @@ class Selector:
                 typing.cast("html.HtmlElement", self.root).drop_tree()
         except (AttributeError, AssertionError):
             # 'NoneType' object has no attribute 'drop_tree'
+            if document is not None:
+                document.bump()
             raise CannotDropElementWithoutParent(no_parent_message)
+        if document is not None:
+            document.bump()
 
     @property
     def attrib(self) -> dict[str, str]:
@@ -988,6 +1079,35 @@ class Selector:
             return {}
 
         return dict(self.root.attrib)
+
+    @property
+    def provenance(self) -> Provenance:
+        """
+        Return the provenance describing where this selector's value comes
+        from.
+
+        Only available when the selector was created with provenance mode
+        enabled. Elements, attributes, text and tail nodes are identified
+        separately, while computed XPath scalars carry a ``derived`` provenance
+        with no node. Raise :class:`ValueError` when provenance is off so that
+        no tree references are retained on the default path.
+        """
+        if self._provenance is None:
+            raise ValueError(
+                "This selector has no provenance. Create it with "
+                "provenance=True or a document name to enable provenance mode."
+            )
+        return self._provenance
+
+    def locate(self) -> LocatedNode:
+        """
+        Resolve this selector's provenance back to a node of the parsed tree.
+
+        Raise :class:`~parsel.provenance.StaleProvenanceError` when the node
+        was dropped or the tree was mutated after capture, rather than
+        returning a different node that happens to occupy the same path.
+        """
+        return self.provenance.locate()
 
     def __bool__(self) -> bool:
         """

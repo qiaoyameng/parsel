@@ -3,6 +3,19 @@
 History
 -------
 
+unreleased
+~~~~~~~~~~
+
+* Added optional provenance mode. Pass ``provenance=True`` (or a document
+  name) to ``Selector`` to make CSS and XPath results carry a
+  ``.provenance`` object identifying their document, node kind and path.
+  Elements, attributes, text and tail nodes are tracked separately, computed
+  XPath scalars are reported as derived results with no invented node, and
+  resolving stale locations after ``drop()`` or ``remove_namespaces()``
+  raises ``StaleProvenanceError`` instead of pointing to a node that reuses
+  the same path. Provenance is off by default and keeps no extra tree
+  reference in that mode.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

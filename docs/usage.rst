@@ -1252,10 +1252,78 @@ You can pass several namespaces (here we're using shorter 1-letter prefixes)::
      'https://img1.blogblog.com/img/b16-rounded.gif',
      ...]
 
+.. _topics-provenance:
+
+Provenance: locating values back in the document
+-------------------------------------------------
+
+The same extracted string can come from different nodes. When a cleaned value
+looks wrong, provenance mode lets you trace each CSS or XPath result back to
+the exact node of the *parsed* tree it came from, instead of searching the
+extracted string back into the raw markup.
+
+Enable it by passing ``provenance=True`` (or a document name) when building
+the :class:`~parsel.selector.Selector`. Every selector produced by chained
+``.xpath()`` and ``.css()`` calls then carries a
+:class:`~parsel.provenance.Provenance` object on its ``.provenance``
+attribute::
+
+    >>> from parsel import Selector, NodeKind
+    >>> sel = Selector(
+    ...     text='<body><p class="dup">same</p><p class="dup">same</p></body>',
+    ...     provenance="products",
+    ... )
+    >>> for node in sel.css("p.dup::text"):
+    ...     provenance = node.provenance
+    ...     print(provenance.document.name, provenance.kind, provenance.path)
+    products text /html/body/p[1]/text()[1]
+    products text /html/body/p[2]/text()[1]
+
+Elements, attributes, text nodes and tail nodes are identified separately, so
+identical values never collapse into one location. Computed XPath scalars such
+as ``count()``, ``string()`` or ``concat()`` have no single source node; they
+are reported as :data:`~parsel.provenance.NodeKind.DERIVED` results and no
+node is invented for them::
+
+    >>> sel.xpath("count(//p)")[0].provenance.kind == NodeKind.DERIVED
+    True
+
+Call :meth:`~parsel.selector.Selector.locate` to resolve a still-valid
+provenance back to a :class:`~parsel.provenance.LocatedNode`.
+
+Paths describe the parsed tree, not byte offsets in the source document, and
+they are not guaranteed to survive tree mutations. Dropping a node bumps the
+document generation: the old provenance becomes stale and raises
+:class:`~parsel.provenance.StaleProvenanceError` instead of silently pointing
+to whatever node later occupies the same path::
+
+    >>> from parsel import StaleProvenanceError
+    >>> page = Selector(
+    ...     text="<body><ul><li>a</li><li>b</li></ul></body>", provenance=True
+    ... )
+    >>> original = page.xpath("//li[1]")[0].provenance
+    >>> page.xpath("//li[1]")[0].drop()
+    >>> original.is_stale
+    True
+    >>> original.locate()  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+        ...
+    parsel.provenance.StaleProvenanceError: ...
+
+:meth:`~parsel.selector.Selector.remove_namespaces` is another in-place
+mutation: locations captured before the call are stale afterwards, while new
+selections describe the post-mutation tree.
+
+Each parsed tree has its own document identity. Combining selectors from two
+documents in one :class:`~parsel.selector.SelectorList` keeps every entry tied
+to its own document, so sources are never mixed. Provenance is only available
+for HTML and XML selectors and is off by default; with it disabled, no extra
+reference to the tree is retained.
+
 .. _topics-xpath-variables:
 
 Variables in XPath expressions
-------------------------------
+-------------------------------
 
 XPath allows you to reference variables in your XPath expressions, using
 the ``$somevariable`` syntax. This is somewhat similar to parameterized

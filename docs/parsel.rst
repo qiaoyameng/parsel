@@ -21,6 +21,15 @@ parsel.selector
     :show-inheritance:
 
 
+parsel.provenance
+-----------------
+
+.. automodule:: parsel.provenance
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
 parsel.utils
 ------------
 
